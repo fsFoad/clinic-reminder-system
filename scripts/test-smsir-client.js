@@ -55,7 +55,6 @@ global.fetch = async (url, init) => {
   assert.ok(calls[0].url.includes('/send/likeToLike'));
   const headers = calls[0].init.headers;
   assert.strictEqual(headers['X-API-KEY'], 'test-key-not-real');
-  assert.strictEqual(headers['x-api-key'], 'test-key-not-real');
   assert.strictEqual(headers.Accept, 'text/plain');
   const body = JSON.parse(calls[0].init.body);
   assert.strictEqual(body.lineNumber, 30002108030582);

@@ -117,12 +117,10 @@ async function request(method, path, { query, body, traceId = null } = {}) {
   }
 
   const headers = {
-    // Docs: ACCEPT application/json|xml; samples also use text/plain for send methods.
+    // Official docs: Accept text/plain|json, auth header name X-API-KEY.
     Accept: 'text/plain',
     'Content-Type': 'application/json',
-    // Official header name is X-API-KEY; some stacks normalize to lowercase.
     'X-API-KEY': cfg.apiKey,
-    'x-api-key': cfg.apiKey,
   };
   const init = { method, headers };
   if (body !== undefined) {

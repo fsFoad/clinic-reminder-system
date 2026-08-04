@@ -23,8 +23,12 @@ Front (`clinic-reminder-front`): set `useClinicMock: false` and run `npm start` 
 - **Promotional line**: messages to blacklisted numbers fail (`messageIds` entry `0`). Production needs a **service line** (9000 / 998).
 - **No webhook**: inbound replies are polled with `GET /receive/latest` (each message returned once). Interval: `SMSIR_POLL_MS` (default 300000 = 5 min), toggle with `SMSIR_POLL_ENABLED`.
 - Optional delivery refresh via `GET /send/pack/{packId}` (`SMSIR_DELIVERY_POLL_ENABLED`).
+- Live SMS via **POST `/send/likeToLike`** (`messageTexts` + `mobiles` parallel arrays). Legacy `/send/bulk` remains in the client but reminders use likeToLike.
+- Docs sample pack `2b99e63c-…` / messageIds `86522023` is **rejected** — never treated as success.
+- Auth header: `X-API-KEY` only (do not send duplicate `x-api-key`).
 - Set `SMSIR_DRY_RUN=true` to fake sends without calling the API.
-- Live one-shot send only if you set `SMSIR_SMOKE_MOBILE` and run `yarn smsir:smoke`.
+- Live one-shot: `SMSIR_SMOKE_MOBILE=09… yarn smsir:smoke` (logs include `traceId`).
+- Remind API returns `traceId` + header `X-Trace-Id` — grep server logs by that UUID.
 
 ## Scripts
 
