@@ -1,9 +1,27 @@
 {
   "name": "clinic-reminder-system",
   "packageManager": "yarn@4.14.1",
+  "scripts": {
+    "start": "node server.js",
+    "migrate": "node -r dotenv/config node_modules/node-pg-migrate/bin/node-pg-migrate.js up -f migrate.json -m db/migrations",
+    "migrate:down": "node -r dotenv/config node_modules/node-pg-migrate/bin/node-pg-migrate.js down -f migrate.json -m db/migrations",
+    "migrate:create": "node-pg-migrate create -f migrate.json -m db/migrations",
+    "db:seed": "node scripts/seed.js",
+    "test:db": "node test-connection.js",
+    "test:parser": "node scripts/test-parser.js",
+    "test:smsir": "node scripts/test-smsir-client.js",
+    "smsir:smoke": "node -r dotenv/config scripts/smsir-smoke.js"
+  },
   "dependencies": {
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "pg": "^8.22.0"
+    "multer": "^2.2.0",
+    "node-pg-migrate": "^7.9.1",
+    "pdf-parse": "^2.4.5",
+    "pg": "^8.22.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/multer": "^2.2.0"
   }
 }
