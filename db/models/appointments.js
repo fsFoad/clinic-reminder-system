@@ -40,7 +40,7 @@ async function findAll({ userId, limit = 100, offset = 0 } = {}) {
   const { rows } = await query(
     `SELECT * FROM appointments
      WHERE user_id = $1
-     ORDER BY appointment_date DESC, appointment_time DESC
+     ORDER BY created_at DESC, id DESC
      LIMIT $2 OFFSET $3`,
     [String(userId), limit, offset]
   );
@@ -135,7 +135,7 @@ async function findByPatientId(patientId, { userId = null } = {}) {
       `SELECT *
        FROM appointments
        WHERE patient_id = $1 AND user_id = $2
-       ORDER BY appointment_date DESC, appointment_time DESC`,
+       ORDER BY created_at DESC, id DESC`,
       [patientId, String(userId)]
     );
     return rows;
@@ -144,7 +144,7 @@ async function findByPatientId(patientId, { userId = null } = {}) {
     `SELECT *
      FROM appointments
      WHERE patient_id = $1
-     ORDER BY appointment_date DESC, appointment_time DESC`,
+     ORDER BY created_at DESC, id DESC`,
     [patientId]
   );
   return rows;
@@ -269,7 +269,7 @@ async function getStatusSummary({
   const order =
     startDate && endDate
       ? 'ORDER BY appointment_date, appointment_time'
-      : 'ORDER BY appointment_date DESC, appointment_time DESC';
+      : 'ORDER BY created_at DESC, appointment_id DESC';
 
   const { rows } = await query(
     `SELECT *

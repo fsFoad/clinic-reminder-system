@@ -29,7 +29,7 @@ async function findAll({ userId, limit = 100, offset = 0 } = {}) {
   const { rows } = await query(
     `SELECT * FROM patients
      WHERE user_id = $1
-     ORDER BY id
+     ORDER BY created_at DESC, id DESC
      LIMIT $2 OFFSET $3`,
     [String(userId), limit, offset]
   );
@@ -176,7 +176,7 @@ async function listDirectory({ userId, q = null, limit = 200, offset = 0 } = {})
        ) AS channels
      FROM patients p
      ${where}
-     ORDER BY p.id DESC
+     ORDER BY p.created_at DESC, p.id DESC
      LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
     params
   );
