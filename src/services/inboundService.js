@@ -15,6 +15,7 @@ const {
 } = require('../constants');
 
 const { parsePatientResponse } = require('./responseParser');
+const realtime = require('../realtime/hub');
 
 
 
@@ -216,6 +217,24 @@ async function handleInboundMessage({
 
 
 
+  try {
+    realtime.broadcast(
+      'inbound_message',
+      {
+        appointmentId: updated?.id ?? appointment.id,
+        patientId: identity.patient_id,
+        messageId: inbound.id,
+        intent: parsed.intent,
+        status: parsed.status,
+        channel,
+        contentPreview: String(content || '').slice(0, 80),
+      },
+      { userId: ownerId },
+    );
+  } catch (_e) {
+    /* realtime is best-effort */
+  }
+
   return {
 
     ok: true,
@@ -316,7 +335,19 @@ async function handleDeliveryWebhook({
 
   });
 
-
+  try {
+    realtime.broadcast(
+      'delivery_status',
+      {
+        appointmentId: message.appointment_id,
+        messageId: message.id,
+        deliveryStatus,
+      },
+      { userId: String(message.user_id) },
+    );
+  } catch (_e) {
+    /* realtime is best-effort */
+  }
 
   return { ok: true, message: updated };
 

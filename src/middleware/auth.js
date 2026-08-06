@@ -34,7 +34,11 @@ function defaultUserId() {
 
 /** Express middleware: sets req.userId (always a non-empty string). */
 function attachUser(req, _res, next) {
-  req.userId = resolveUserIdFromAuthHeader(req.headers.authorization) || defaultUserId();
+  const fromHeader = resolveUserIdFromAuthHeader(req.headers.authorization);
+  const fromQuery = resolveUserIdFromAuthHeader(
+    req.query?.access_token ? `Bearer ${String(req.query.access_token)}` : '',
+  );
+  req.userId = fromHeader || fromQuery || defaultUserId();
   next();
 }
 

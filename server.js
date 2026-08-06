@@ -93,8 +93,9 @@ function startSmsirInboundPoller() {
   }
 
   let intervalMs = Number(process.env.SMSIR_POLL_MS);
-  if (!Number.isFinite(intervalMs) || intervalMs <= 0) intervalMs = 300_000;
-  const minMs = 60_000;
+  // Default 60s so inbound replies reach the dashboard quickly (SSE pushes UI after poll).
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) intervalMs = 60_000;
+  const minMs = 30_000;
   if (intervalMs < minMs) intervalMs = minMs;
 
   console.log(`[smsir] inbound poller every ${intervalMs}ms (receive/latest + pack delivery)`);
@@ -120,6 +121,7 @@ function startSmsirInboundPoller() {
     }
   };
 
-  setTimeout(tick, 15_000);
+  // First tick soon after boot so inbound replies aren't stuck waiting a full interval.
+  setTimeout(tick, 5_000);
   setInterval(tick, intervalMs);
 }

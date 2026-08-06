@@ -28,20 +28,36 @@ function createApp() {
 
   app.use((err, _req, res, _next) => {
     console.error(err);
-    const msg = err.message || 'Internal Server Error';
+    let status = err.status || 500;
+    let msg = err.message || 'Internal Server Error';
+    let code = err.code;
+
+    // Safety net: never leak Postgres unique-violation text to clients.
+    if (err.code === '23505') {
+      const hay = `${err.constraint || ''} ${err.message || ''} ${err.detail || ''}`;
+      const isChannel = hay.includes(
+        'patient_channel_identities_user_channel_external_id_key'
+      );
+      status = 409;
+      code = isChannel ? 'duplicate_channel' : 'conflict';
+      msg = isChannel
+        ? 'This mobile number or channel is already registered for another patient'
+        : 'This operation conflicts with existing data';
+    }
+
     // `error` is the historical field; `message` mirrors it for Angular interceptors.
     const body = {
       error: msg,
       message: msg,
     };
-    if (err.code) body.code = err.code;
+    if (code) body.code = code;
     if (err.smsirStatus != null) body.smsirStatus = err.smsirStatus;
     if (err.details) body.details = err.details;
     if (err.traceId) {
       body.traceId = err.traceId;
       res.setHeader('X-Trace-Id', err.traceId);
     }
-    res.status(err.status || 500).json(body);
+    res.status(status).json(body);
   });
 
   return app;

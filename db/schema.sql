@@ -97,6 +97,9 @@ CREATE TABLE messages (
   direction           VARCHAR(16) NOT NULL,
   content             TEXT NOT NULL,
   provider_message_id VARCHAR(255),
+  provider_pack_id    VARCHAR(255),
+  -- Last known SMS.ir DeliveryState (1 delivered · 2/4/6/7 failed · 3/5 in progress).
+  provider_delivery_state INT,
   delivery_status     VARCHAR(32) NOT NULL DEFAULT 'pending',
   note                VARCHAR(255),
   sent_at             TIMESTAMPTZ,
@@ -155,13 +158,18 @@ CREATE INDEX idx_activity_log_event_type
 
 -- One row per appointment for the main dashboard table.
 -- awaiting_send / awaiting_reply are computed pipeline states (not status enum values).
+-- awaiting_reply requires delivered outbound — failed / still-checking DLR must not look like "waiting for reply".
 -- Fresh installs: CREATE is fine. Live DBs: migration drops then recreates (OR REPLACE cannot add columns).
 CREATE OR REPLACE VIEW v_appointment_status_summary AS
 SELECT
   base.*,
   (base.appointment_status = 'scheduled' AND NOT base.reminder_sent) AS awaiting_send,
-  (base.appointment_status = 'scheduled' AND base.reminder_sent AND NOT base.has_response)
-    AS awaiting_reply
+  (
+    base.appointment_status = 'scheduled'
+    AND base.reminder_sent
+    AND NOT base.has_response
+    AND base.latest_outbound_delivery_status = 'delivered'
+  ) AS awaiting_reply
 FROM (
   SELECT
     a.id AS appointment_id,
@@ -174,7 +182,15 @@ FROM (
     a.status AS appointment_status,
     latest_out.channel AS latest_outbound_channel,
     latest_out.delivery_status AS latest_outbound_delivery_status,
+    latest_out.provider_delivery_state AS latest_outbound_delivery_state,
+    CASE
+      WHEN latest_out.delivery_status = 'failed' THEN 'failed'
+      WHEN latest_out.delivery_status = 'delivered' THEN 'delivered'
+      WHEN latest_out.delivery_status IN ('sent', 'pending') THEN 'reviewing'
+      ELSE NULL
+    END AS latest_outbound_delivery_label,
     latest_out.sent_at AS latest_outbound_sent_at,
+    latest_out.delivered_at AS latest_outbound_delivered_at,
     EXISTS (
       SELECT 1
       FROM messages m_in
@@ -195,7 +211,8 @@ FROM (
   FROM appointments a
   JOIN patients p ON p.id = a.patient_id
   LEFT JOIN LATERAL (
-    SELECT m.channel, m.delivery_status, m.sent_at, m.created_at
+    SELECT m.channel, m.delivery_status, m.provider_delivery_state,
+           m.sent_at, m.delivered_at, m.created_at
     FROM messages m
     WHERE m.appointment_id = a.id
       AND m.direction = 'outbound'

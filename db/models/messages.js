@@ -95,6 +95,7 @@ async function update(id, fields) {
     note: 'note',
     sentAt: 'sent_at',
     deliveredAt: 'delivered_at',
+    providerDeliveryState: 'provider_delivery_state',
   };
 
   const sets = [];
@@ -124,16 +125,28 @@ async function update(id, fields) {
   return rows[0] || null;
 }
 
-async function updateDeliveryStatus(id, deliveryStatus, { deliveredAt = null, sentAt = null } = {}) {
+async function updateDeliveryStatus(
+  id,
+  deliveryStatus,
+  { deliveredAt = null, sentAt = null, providerDeliveryState = undefined } = {}
+) {
+  const params = [id, deliveryStatus, sentAt, deliveredAt];
+  let deliveryStateSql = '';
+  if (providerDeliveryState !== undefined) {
+    params.push(providerDeliveryState);
+    deliveryStateSql = `, provider_delivery_state = $${params.length}`;
+  }
+
   const { rows } = await query(
     `UPDATE messages
      SET
        delivery_status = $2,
        sent_at = COALESCE($3, sent_at),
        delivered_at = COALESCE($4, delivered_at)
+       ${deliveryStateSql}
      WHERE id = $1
      RETURNING *`,
-    [id, deliveryStatus, sentAt, deliveredAt]
+    params
   );
   return rows[0] || null;
 }
@@ -214,13 +227,27 @@ async function findLatestPendingByPatient(patientId) {
   return rows[0] || null;
 }
 
-/** Outbound reminder sends for the reminders log UI. */
-async function listOutboundReminders({ userId, limit = 200, offset = 0, channel = null } = {}) {
+/**
+ * Message log for reminders UI — outbound sends AND inbound patient replies.
+ * Optional direction: 'outbound' | 'inbound' | null (both).
+ */
+async function listOutboundReminders({
+  userId,
+  limit = 200,
+  offset = 0,
+  channel = null,
+  direction = null,
+} = {}) {
   const params = [String(userId)];
   let channelFilter = '';
   if (channel) {
     params.push(channel);
     channelFilter = `AND m.channel = $${params.length}`;
+  }
+  let directionFilter = '';
+  if (direction === 'outbound' || direction === 'inbound') {
+    params.push(direction);
+    directionFilter = `AND m.direction = $${params.length}`;
   }
   params.push(limit);
   const limitIdx = params.length;
@@ -238,7 +265,9 @@ async function listOutboundReminders({ userId, limit = 200, offset = 0, channel 
        a.visit_type,
        a.status AS appointment_status,
        m.channel,
+       m.direction,
        m.delivery_status,
+       m.provider_delivery_state,
        m.note,
        m.content,
        m.provider_message_id,
@@ -250,13 +279,23 @@ async function listOutboundReminders({ userId, limit = 200, offset = 0, channel 
      JOIN appointments a ON a.id = m.appointment_id AND a.user_id = m.user_id
      JOIN patients p ON p.id = a.patient_id AND p.user_id = m.user_id
      WHERE m.user_id = $1
-       AND m.direction = 'outbound'
        ${channelFilter}
+       ${directionFilter}
      ORDER BY COALESCE(m.sent_at, m.created_at) DESC, m.id DESC
      LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
     params
   );
-  return rows;
+  return rows.map((row) => ({
+    ...row,
+    delivery_label:
+      row.delivery_status === 'failed'
+        ? 'failed'
+        : row.delivery_status === 'delivered'
+          ? 'delivered'
+          : row.delivery_status === 'sent' || row.delivery_status === 'pending'
+            ? 'reviewing'
+            : null,
+  }));
 }
 
 async function existsWithNote(appointmentId, note) {

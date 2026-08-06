@@ -11,16 +11,70 @@ const { toLocal09 } = require('../utils/iranMobile');
 
 const ALLOWED_APPOINTMENT_STATUSES = new Set(Object.values(APPOINTMENT_STATUS));
 
-function badRequest(message) {
+const CHANNEL_UNIQUE_CONSTRAINT = 'patient_channel_identities_user_channel_external_id_key';
+
+function badRequest(message, code) {
   const err = new Error(message);
   err.status = 400;
+  if (code) err.code = code;
   return err;
 }
 
-function notFound(message) {
+function notFound(message, code) {
   const err = new Error(message);
   err.status = 404;
+  if (code) err.code = code;
   return err;
+}
+
+function conflict(message, code) {
+  const err = new Error(message);
+  err.status = 409;
+  if (code) err.code = code;
+  return err;
+}
+
+function duplicateChannelError() {
+  return conflict(
+    'This mobile number or channel is already registered for another patient',
+    'duplicate_channel'
+  );
+}
+
+/** True when Postgres unique violation is on tenant+channel+external_id. */
+function isDuplicateChannelPgError(err) {
+  if (!err || err.code !== '23505') return false;
+  const hay = `${err.constraint || ''} ${err.message || ''} ${err.detail || ''}`;
+  return hay.includes(CHANNEL_UNIQUE_CONSTRAINT);
+}
+
+function rethrowMappedDbError(err) {
+  if (isDuplicateChannelPgError(err)) throw duplicateChannelError();
+  throw err;
+}
+
+/**
+ * Pre-check channel external IDs for the tenant.
+ * @param {Array<{channel: string, externalId: string}>} channels
+ * @param {string} userId
+ * @param {{ excludePatientId?: number|null }} [opts]
+ */
+async function assertChannelsAvailable(channels, userId, { excludePatientId = null } = {}) {
+  for (const ch of channels) {
+    const existing = await patientChannelIdentities.findByChannelExternalId(
+      ch.channel,
+      ch.externalId,
+      { userId }
+    );
+    if (!existing) continue;
+    if (
+      excludePatientId != null &&
+      Number(existing.patient_id) === Number(excludePatientId)
+    ) {
+      continue;
+    }
+    throw duplicateChannelError();
+  }
 }
 
 function normalizeUserId(userId) {
@@ -81,35 +135,40 @@ async function registerPatient({ patient, channels, userId }) {
     throw badRequest('patient.name is required');
   }
   const normalizedChannels = normalizeChannels(channels);
+  await assertChannelsAvailable(normalizedChannels, uid);
 
-  return withTransaction(async (client) => {
-    const createdPatient = await patients.create(
-      {
-        name: String(patient.name).trim(),
-        notes: patient.notes != null ? String(patient.notes).trim() || null : null,
-        userId: uid,
-      },
-      client
-    );
-
-    const createdChannels = [];
-    for (const ch of normalizedChannels) {
-      createdChannels.push(
-        await patientChannelIdentities.create(
-          {
-            patientId: createdPatient.id,
-            channel: ch.channel,
-            externalId: ch.externalId,
-            isPreferred: ch.isPreferred,
-            userId: uid,
-          },
-          client
-        )
+  try {
+    return await withTransaction(async (client) => {
+      const createdPatient = await patients.create(
+        {
+          name: String(patient.name).trim(),
+          notes: patient.notes != null ? String(patient.notes).trim() || null : null,
+          userId: uid,
+        },
+        client
       );
-    }
 
-    return { patient: createdPatient, channels: createdChannels };
-  });
+      const createdChannels = [];
+      for (const ch of normalizedChannels) {
+        createdChannels.push(
+          await patientChannelIdentities.create(
+            {
+              patientId: createdPatient.id,
+              channel: ch.channel,
+              externalId: ch.externalId,
+              isPreferred: ch.isPreferred,
+              userId: uid,
+            },
+            client
+          )
+        );
+      }
+
+      return { patient: createdPatient, channels: createdChannels };
+    });
+  } catch (err) {
+    rethrowMappedDbError(err);
+  }
 }
 
 /** Update patient name/notes and upsert channel identities (same tenant only). */
@@ -123,65 +182,70 @@ async function updatePatient(patientId, { patient, channels, userId }) {
   const normalizedChannels = normalizeChannels(channels);
 
   const existing = await patients.findById(id, { userId: uid });
-  if (!existing) throw notFound(`patient ${id} not found`);
+  if (!existing) throw notFound(`patient ${id} not found`, 'patient_not_found');
+  await assertChannelsAvailable(normalizedChannels, uid, { excludePatientId: id });
 
-  return withTransaction(async (client) => {
-    const updatedPatient = await patients.update(
-      id,
-      {
-        name: String(patient.name).trim(),
-        notes: patient.notes != null ? String(patient.notes).trim() || null : null,
-        userId: uid,
-      },
-      client
-    );
+  try {
+    return await withTransaction(async (client) => {
+      const updatedPatient = await patients.update(
+        id,
+        {
+          name: String(patient.name).trim(),
+          notes: patient.notes != null ? String(patient.notes).trim() || null : null,
+          userId: uid,
+        },
+        client
+      );
 
-    const existingChannels = await patientChannelIdentities.findByPatientId(id, client);
-    const byChannel = new Map(existingChannels.map((c) => [c.channel, c]));
-    const keptChannels = new Set();
-    const resultChannels = [];
+      const existingChannels = await patientChannelIdentities.findByPatientId(id, client);
+      const byChannel = new Map(existingChannels.map((c) => [c.channel, c]));
+      const keptChannels = new Set();
+      const resultChannels = [];
 
-    for (const ch of normalizedChannels) {
-      keptChannels.add(ch.channel);
-      const prev = byChannel.get(ch.channel);
-      if (prev) {
-        resultChannels.push(
-          await patientChannelIdentities.update(
-            prev.id,
-            { externalId: ch.externalId, isPreferred: ch.isPreferred },
-            client
-          )
-        );
-      } else {
-        resultChannels.push(
-          await patientChannelIdentities.create(
-            {
-              patientId: id,
-              channel: ch.channel,
-              externalId: ch.externalId,
-              isPreferred: ch.isPreferred,
-              userId: uid,
-            },
-            client
-          )
-        );
+      for (const ch of normalizedChannels) {
+        keptChannels.add(ch.channel);
+        const prev = byChannel.get(ch.channel);
+        if (prev) {
+          resultChannels.push(
+            await patientChannelIdentities.update(
+              prev.id,
+              { externalId: ch.externalId, isPreferred: ch.isPreferred },
+              client
+            )
+          );
+        } else {
+          resultChannels.push(
+            await patientChannelIdentities.create(
+              {
+                patientId: id,
+                channel: ch.channel,
+                externalId: ch.externalId,
+                isPreferred: ch.isPreferred,
+                userId: uid,
+              },
+              client
+            )
+          );
+        }
       }
-    }
 
-    for (const prev of existingChannels) {
-      if (!keptChannels.has(prev.channel)) {
-        await patientChannelIdentities.remove(prev.id, client);
+      for (const prev of existingChannels) {
+        if (!keptChannels.has(prev.channel)) {
+          await patientChannelIdentities.remove(prev.id, client);
+        }
       }
-    }
 
-    const preferred = resultChannels.find((c) => c.is_preferred) || resultChannels[0];
-    if (preferred) {
-      await patientChannelIdentities.setPreferred(preferred.id, client);
-    }
+      const preferred = resultChannels.find((c) => c.is_preferred) || resultChannels[0];
+      if (preferred) {
+        await patientChannelIdentities.setPreferred(preferred.id, client);
+      }
 
-    const finalChannels = await patientChannelIdentities.findByPatientId(id, client);
-    return { patient: updatedPatient, channels: finalChannels };
-  });
+      const finalChannels = await patientChannelIdentities.findByPatientId(id, client);
+      return { patient: updatedPatient, channels: finalChannels };
+    });
+  } catch (err) {
+    rethrowMappedDbError(err);
+  }
 }
 
 /** Create appointment for an existing patient (must belong to same user). */
@@ -201,7 +265,7 @@ async function createAppointment({ patientId, appointment, userId }) {
   );
 
   const existing = await patients.findById(id, { userId: uid });
-  if (!existing) throw notFound(`patient ${id} not found`);
+  if (!existing) throw notFound(`patient ${id} not found`, 'patient_not_found');
 
   const createdAppointment = await appointments.create({
     patientId: id,
@@ -230,7 +294,7 @@ async function getAppointment(appointmentId, { userId }) {
   if (!id) throw badRequest('appointmentId is required');
 
   const appointment = await appointments.findById(id, { userId: uid });
-  if (!appointment) throw notFound(`appointment ${id} not found`);
+  if (!appointment) throw notFound(`appointment ${id} not found`, 'appointment_not_found');
 
   const patient = await patients.findWithChannels(appointment.patient_id, { userId: uid });
   return { patient, appointment };
@@ -246,7 +310,7 @@ async function updateAppointment(appointmentId, { appointment: body, userId }) {
   if (!id) throw badRequest('appointmentId is required');
 
   const existing = await appointments.findById(id, { userId: uid });
-  if (!existing) throw notFound(`appointment ${id} not found`);
+  if (!existing) throw notFound(`appointment ${id} not found`, 'appointment_not_found');
 
   const patch = body || {};
   const nextDateRaw =
@@ -266,7 +330,7 @@ async function updateAppointment(appointmentId, { appointment: body, userId }) {
     if (!pid) throw badRequest('patientId is invalid');
     if (pid !== Number(existing.patient_id)) {
       const patientOk = await patients.findById(pid, { userId: uid });
-      if (!patientOk) throw notFound(`patient ${pid} not found`);
+      if (!patientOk) throw notFound(`patient ${pid} not found`, 'patient_not_found');
       nextPatientId = pid;
     }
   }
@@ -295,7 +359,7 @@ async function updateAppointment(appointmentId, { appointment: body, userId }) {
   }
 
   const updated = await appointments.update(id, fields);
-  if (!updated) throw notFound(`appointment ${id} not found`);
+  if (!updated) throw notFound(`appointment ${id} not found`, 'appointment_not_found');
 
   await activityLog.create({
     appointmentId: id,
@@ -347,6 +411,7 @@ async function registerIntake({ patient, channels, appointment, userId }) {
         throw badRequest('patient.name is required');
       }
       const normalizedChannels = normalizeChannels(channels);
+      await assertChannelsAvailable(normalizedChannels, uid);
       const p = await patients.create(
         {
           name: String(patient.name).trim(),
@@ -405,7 +470,7 @@ async function registerIntake({ patient, channels, appointment, userId }) {
       channels: createdChannels,
       appointment: createdAppointment,
     };
-  });
+  }).catch(rethrowMappedDbError);
 }
 
 module.exports = {

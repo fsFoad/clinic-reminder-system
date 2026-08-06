@@ -13,6 +13,7 @@ const clinicSettings = require('../services/clinicSettings');
 const smsInboundPoller = require('../services/smsInboundPoller');
 const smsir = require('../channels/smsir');
 const { DEFAULT_FALLBACK_HOURS } = require('../constants');
+const realtime = require('../realtime/hub');
 
 const router = express.Router();
 const upload = multer({
@@ -31,6 +32,34 @@ router.get('/health', (_req, res) => {
       // Never expose API key
       lineConfigured: Boolean(cfg.lineNumber),
     },
+    realtimeClients: realtime.clientCount(),
+  });
+});
+
+/** Server-Sent Events — live inbound/appointment updates for the open dashboard tab. */
+router.get('/events', (req, res) => {
+  const userId = String(req.userId);
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+  realtime.writeEvent(res, 'connected', { userId, clients: realtime.clientCount(userId) });
+  const remove = realtime.addClient(userId, res);
+
+  const heartbeat = setInterval(() => {
+    if (res.writableEnded) return;
+    try {
+      res.write(`: ping ${Date.now()}\n\n`);
+    } catch {
+      /* ignore */
+    }
+  }, 25_000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    remove();
   });
 });
 
@@ -215,7 +244,11 @@ router.get('/patients/:id', async (req, res, next) => {
       userId: req.userId,
     });
     if (!row) {
-      res.status(404).json({ error: 'patient_not_found' });
+      res.status(404).json({
+        error: 'patient_not_found',
+        message: 'patient_not_found',
+        code: 'patient_not_found',
+      });
       return;
     }
     const appts = await db.appointments.findByPatientId(row.id, { userId: req.userId });
@@ -333,14 +366,18 @@ router.put('/appointments/:id', async (req, res, next) => {
   }
 });
 
-/** Log of outbound reminder sends */
+/** Log of reminder sends + inbound patient replies */
 router.get('/reminders', async (req, res, next) => {
   try {
+    const directionRaw = req.query.direction ? String(req.query.direction) : null;
+    const direction =
+      directionRaw === 'outbound' || directionRaw === 'inbound' ? directionRaw : null;
     const rows = await db.messages.listOutboundReminders({
       userId: req.userId,
       limit: Number(req.query.limit || 200),
       offset: Number(req.query.offset || 0),
       channel: req.query.channel ? String(req.query.channel) : null,
+      direction,
     });
     res.json(rows);
   } catch (err) {

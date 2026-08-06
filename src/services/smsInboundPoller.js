@@ -8,6 +8,7 @@
 const db = require('../../db');
 const smsir = require('../channels/smsir');
 const inboundService = require('./inboundService');
+const realtime = require('../realtime/hub');
 const { DELIVERY_STATUS, EVENT_TYPE } = require('../constants');
 const { log, newTraceId } = require('../utils/log');
 
@@ -26,41 +27,53 @@ function deliveryPollEnabled() {
 }
 
 /**
- * Map SMS.ir DeliveryState byte → our delivery_status.
- * Documented sample uses 1 for successful handset delivery.
+ * Map SMS.ir DeliveryState → our delivery_status.
+ * Official table (sms.ir/rest-api «کدهای وضعیت دلیوری»):
+ * 1 delivered · 2 not to handset · 3 telecom processing · 4 not to telecom ·
+ * 5 reached telecom · 6 error · 7 blacklist.
+ * In-transit (3, 5) stay null so we keep polling; terminal failures update to failed.
  */
 function mapDeliveryState(state) {
   if (state == null || state === '') return null;
   const n = Number(state);
   if (n === 1) return DELIVERY_STATUS.DELIVERED;
-  if (n === 2 || n === 3 || n === 5 || n === 8 || n === 9) return DELIVERY_STATUS.FAILED;
+  if (n === 2 || n === 4 || n === 6 || n === 7) return DELIVERY_STATUS.FAILED;
   return null;
 }
 
-async function processInboundLatest({ count = 50 } = {}) {
-  if (!smsir.isConfigured() && !smsir.getConfig().dryRun) {
-    return { ok: false, error: 'smsir_not_configured', processed: 0, results: [] };
-  }
+function normalizeInboxItem(item) {
+  const mobile = item.mobile ?? item.Mobile;
+  const content = item.messageText ?? item.MessageText ?? '';
+  const receiveId = item.receiveReturnId ?? item.ReceiveReturnId ?? null;
+  return {
+    mobile: mobile != null ? String(mobile) : null,
+    content: String(content),
+    receiveId: receiveId != null ? String(receiveId) : null,
+  };
+}
 
-  const response = await smsir.receiveLatest({ count });
-  const items = Array.isArray(response?.data) ? response.data : [];
+async function handleInboxItems(items, { source } = {}) {
   const results = [];
+  const seen = new Set();
 
-  for (const item of items) {
-    const mobile = item.mobile ?? item.Mobile;
-    const content = item.messageText ?? item.MessageText ?? '';
-    const receiveId = item.receiveReturnId ?? item.ReceiveReturnId ?? null;
+  for (const raw of items) {
+    const item = normalizeInboxItem(raw);
+    if (item.receiveId) {
+      if (seen.has(item.receiveId)) continue;
+      seen.add(item.receiveId);
+    }
 
     try {
       const handled = await inboundService.handleInboundMessage({
         channel: 'sms',
-        externalId: mobile != null ? String(mobile) : '',
-        content: String(content),
-        providerMessageId: receiveId != null ? String(receiveId) : null,
+        externalId: item.mobile || '',
+        content: item.content,
+        providerMessageId: item.receiveId,
       });
       results.push({
-        receiveId,
-        mobile: mobile != null ? String(mobile) : null,
+        source: source || null,
+        receiveId: item.receiveId,
+        mobile: item.mobile,
         ok: handled.ok,
         duplicate: Boolean(handled.duplicate),
         error: handled.error || null,
@@ -69,18 +82,59 @@ async function processInboundLatest({ count = 50 } = {}) {
       });
     } catch (err) {
       results.push({
-        receiveId,
-        mobile: mobile != null ? String(mobile) : null,
+        source: source || null,
+        receiveId: item.receiveId,
+        mobile: item.mobile,
         ok: false,
         error: err.message || String(err),
       });
     }
   }
 
+  return results;
+}
+
+/**
+ * Prefer receive/latest (unread, one-shot). Also sweep receive/live so
+ * messages already marked-read in the SMS.ir panel (or missed between polls)
+ * still land in our DB via provider_message_id dedupe.
+ */
+async function processInboundLatest({ count = 50 } = {}) {
+  if (!smsir.isConfigured() && !smsir.getConfig().dryRun) {
+    return { ok: false, error: 'smsir_not_configured', processed: 0, results: [] };
+  }
+
+  const latestResponse = await smsir.receiveLatest({ count });
+  const latestItems = Array.isArray(latestResponse?.data) ? latestResponse.data : [];
+
+  let liveItems = [];
+  let liveDryRun = false;
+  try {
+    const liveResponse = await smsir.receiveLive({
+      pageSize: Math.min(Math.max(Number(count) || 50, 1), 100),
+      pageNumber: 1,
+      sortByNewest: true,
+    });
+    liveDryRun = Boolean(liveResponse?._dryRun);
+    liveItems = Array.isArray(liveResponse?.data) ? liveResponse.data : [];
+  } catch (err) {
+    log.warn({
+      step: 'smsir_receive_live_failed',
+      error: err.message || String(err),
+      smsirStatus: err.smsirStatus != null ? err.smsirStatus : null,
+    });
+  }
+
+  const latestResults = await handleInboxItems(latestItems, { source: 'latest' });
+  const liveResults = await handleInboxItems(liveItems, { source: 'live' });
+  const results = [...latestResults, ...liveResults];
+
   return {
     ok: true,
-    dryRun: Boolean(response?._dryRun),
-    fetched: items.length,
+    dryRun: Boolean(latestResponse?._dryRun) || liveDryRun,
+    fetched: latestItems.length + liveItems.length,
+    fetchedLatest: latestItems.length,
+    fetchedLive: liveItems.length,
     processed: results.filter((r) => r.ok && !r.duplicate).length,
     duplicates: results.filter((r) => r.duplicate).length,
     results,
@@ -135,31 +189,46 @@ async function processPackDeliveryUpdates({ limit = 40 } = {}) {
     for (const item of items) {
       const messageId = item.messageId ?? item.MessageId;
       if (messageId == null) continue;
-      const status = mapDeliveryState(item.deliveryState ?? item.DeliveryState);
+      const deliveryStateRaw = item.deliveryState ?? item.DeliveryState;
+      const deliveryState =
+        deliveryStateRaw == null || deliveryStateRaw === ''
+          ? null
+          : Number(deliveryStateRaw);
+      const status = mapDeliveryState(deliveryStateRaw);
       log.info({
         traceId: packTrace,
         step: 'delivery_poll_item',
         packId,
         providerMessageId: String(messageId),
-        deliveryState: item.deliveryState ?? item.DeliveryState ?? null,
+        deliveryState: deliveryStateRaw ?? null,
         mappedStatus: status,
       });
-      if (!status) continue;
 
       const local =
         packRows.find((r) => String(r.provider_message_id) === String(messageId)) ||
         (await db.messages.findByProviderMessageId(String(messageId)));
       if (!local) continue;
-      if (local.delivery_status === status) continue;
 
+      const sameStatus = status == null || local.delivery_status === status;
+      const sameState =
+        deliveryState == null ||
+        Number(local.provider_delivery_state) === deliveryState;
+      if (sameStatus && sameState) continue;
+      // In-transit (3/5) has no mapped status — still persist delivery_state and keep polling.
+      if (!status && deliveryState == null) continue;
+
+      const nextStatus = status || local.delivery_status;
       const deliveredAt =
-        status === DELIVERY_STATUS.DELIVERED
+        nextStatus === DELIVERY_STATUS.DELIVERED
           ? item.deliveryDateTime || item.DeliveryDateTime
             ? new Date(Number(item.deliveryDateTime || item.DeliveryDateTime) * 1000).toISOString()
             : new Date().toISOString()
           : null;
 
-      await db.messages.updateDeliveryStatus(local.id, status, { deliveredAt });
+      await db.messages.updateDeliveryStatus(local.id, nextStatus, {
+        deliveredAt,
+        providerDeliveryState: deliveryState,
+      });
       await db.activityLog.create({
         appointmentId: local.appointment_id,
         eventType: EVENT_TYPE.WEBHOOK_RECEIVED,
@@ -168,16 +237,31 @@ async function processPackDeliveryUpdates({ limit = 40 } = {}) {
           trace_id: packTrace,
           provider_message_id: String(messageId),
           provider_pack_id: packId,
-          delivery_status: status,
-          delivery_state: item.deliveryState ?? item.DeliveryState,
+          delivery_status: nextStatus,
+          delivery_state: deliveryState,
         },
         userId: String(local.user_id),
       });
+      try {
+        realtime.broadcast(
+          'delivery_status',
+          {
+            appointmentId: local.appointment_id,
+            messageId: local.id,
+            deliveryStatus: nextStatus,
+            deliveryState,
+          },
+          { userId: String(local.user_id) },
+        );
+      } catch (_e) {
+        /* realtime is best-effort */
+      }
       updated += 1;
       details.push({
         messageId: local.id,
         providerMessageId: String(messageId),
-        deliveryStatus: status,
+        deliveryStatus: nextStatus,
+        deliveryState,
         traceId: packTrace,
       });
     }

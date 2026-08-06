@@ -45,6 +45,7 @@ async function sendReminder(
   if (!appointment) {
     const err = new Error(`Appointment ${appointmentId} not found`);
     err.status = 404;
+    err.code = 'appointment_not_found';
     err.traceId = tid;
     throw err;
   }
@@ -53,6 +54,7 @@ async function sendReminder(
   if (userId != null && String(userId) !== ownerId) {
     const err = new Error(`Appointment ${appointmentId} not found`);
     err.status = 404;
+    err.code = 'appointment_not_found';
     err.traceId = tid;
     throw err;
   }
@@ -60,6 +62,8 @@ async function sendReminder(
   const identity = await resolveSendTarget(appointment.patient_id, channel);
   if (!identity) {
     const err = new Error(`No channel identity for patient ${appointment.patient_id}`);
+    err.status = 404;
+    err.code = 'channel_missing';
     err.traceId = tid;
     throw err;
   }
